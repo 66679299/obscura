@@ -1052,6 +1052,16 @@ fn op_script_cache_put(#[string] url: String, #[string] body: String, #[bigint] 
     if body.len() < 256 || max_age == 0 {
         return;
     }
+    // Fork addition: TTL override (OBSCURA_SCRIPT_CACHE_TTL, seconds). gtag.js
+    // ships cache-control max-age=900 (15 min); fleet operators running many
+    // fresh-identity sessions per hour want a longer reuse window - gtag
+    // bundles are backward-compatible on the /collect endpoint, so serving a
+    // slightly older bundle is safe. 0 / unset keeps the response header TTL.
+    let max_age = std::env::var("OBSCURA_SCRIPT_CACHE_TTL")
+        .ok()
+        .and_then(|v| v.parse::<i64>().ok())
+        .filter(|ttl| *ttl > 0)
+        .unwrap_or(max_age);
     let expires = script_cache_now_unix().saturating_add(max_age.max(0) as u64);
     let payload = serde_json::json!({
         "url": url,
