@@ -8272,7 +8272,31 @@ globalThis.navigator = {
   } },
   getBattery() { return Promise.resolve({ charging: _fp('batteryCharging'), chargingTime: _fp('batteryCharging') ? 0 : Infinity, dischargingTime: _fp('batteryCharging') ? Infinity : Math.floor(3600 + _fpRand(250) * 7200), level: _fp('batteryLevel'), addEventListener(){} }); },
   getGamepads() { return []; },
-  sendBeacon() { return true; },
+  // Fork fix: real sendBeacon - the stub silently swallowed GA4 /collect
+  // pings (gtag prefers sendBeacon), so analytics never arrived. Beacons are
+  // fire-and-forget POSTs through the internal fetch stack; keepalive
+  // semantics are inherent (no response is awaited).
+  sendBeacon(url, data) {
+    try {
+      const target = String(url || "");
+      if (!/^https?:/i.test(target)) return false;
+      let body = "";
+      if (typeof data === "string") {
+        body = data;
+      } else if (data && typeof data.toString === "function") {
+        try { body = String(data); } catch (e) { body = ""; }
+      }
+      Promise.resolve().then(() => _fetch(target, {
+        method: "POST",
+        headers: { "content-type": "text/plain;charset=UTF-8" },
+        body: body,
+        keepalive: true
+      }, "Fetch")).catch(() => {});
+      return true;
+    } catch (e) {
+      return false;
+    }
+  },
   javaEnabled() { return false; },
   geolocation: {
     getCurrentPosition(success, error) {

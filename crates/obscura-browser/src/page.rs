@@ -2509,7 +2509,7 @@ impl Page {
             );
         }
 
-        tracing::info!("Found {} parser-discovered scripts", all_scripts.len());
+        tracing::warn!("Found {} parser-discovered scripts", all_scripts.len());
         let mut fetch_tasks: Vec<(usize, String)> = Vec::new();
 
         for (i, script) in all_scripts.iter().enumerate() {
@@ -2541,13 +2541,16 @@ impl Page {
                     );
                     continue;
                 }
-                if self.should_block_url(&full_url) {
-                    tracing::info!("Blocked script by interception: {}", full_url);
+                let blocked_here = self.should_block_url(&full_url);
+                tracing::warn!("script candidate: url={} blocked={}", full_url, blocked_here);
+                if blocked_here {
+                    tracing::warn!("Blocked script by interception: {}", full_url);
                     continue;
                 }
                 fetch_tasks.push((i, full_url));
             }
         }
+        tracing::warn!("execute_scripts: queued {} script fetches", fetch_tasks.len());
 
         let client = self.http_client.clone();
         let page_callbacks = self.callbacks.clone();
@@ -2595,7 +2598,10 @@ impl Page {
                         .fetch_resource_with_callbacks(&parsed, request, Some(&cbs))
                         .await
                     {
-                        Ok(resp) => Some((idx, url, resp)),
+                        Ok(resp) => {
+                            tracing::warn!("script fetched: {} status={} body={}B", url, resp.status, resp.body.len());
+                            Some((idx, url, resp))
+                        }
                         Err(e) => {
                             tracing::warn!("Failed to fetch script {}: {}", url, e);
                             None

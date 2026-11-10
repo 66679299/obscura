@@ -872,8 +872,11 @@ struct ResourceCacheKey {
     resource_type: ResourceType,
     mode: RequestMode,
     credentials: RequestCredentials,
-    initiator: Option<String>,
-    referrer: Option<String>,
+    // Fork fix (#autoBrowserObscura): `initiator`/`referrer` are per-page values
+    // and would make the key differ on every navigation of the same process,
+    // defeating cross-navigation reuse entirely. Chrome's HTTP cache keys on
+    // URL (+vary headers) only; credential safety is already handled by the
+    // sends_credentials_to / authorization / cookie checks below.
     user_agent: String,
     extra_headers: Vec<(String, String)>,
     max_response_bytes: usize,
@@ -1216,6 +1219,10 @@ impl ObscuraHttpClient {
             .iter()
             .map(|(name, value)| (name.to_ascii_lowercase(), value.clone()))
             .collect::<Vec<_>>();
+        // Fork fix: `Referer` differs per page of the same session and would
+        // defeat cross-navigation reuse; HTTP caches key on URL + vary, and
+        // Referer is not a valid Vary dimension for shared caches.
+        extra_headers.retain(|(name, _)| name != "referer");
         extra_headers.sort();
         if extra_headers.iter().any(|(name, value)| {
             name == "authorization"
@@ -1234,17 +1241,17 @@ impl ObscuraHttpClient {
         {
             return None;
         }
-        Some(ResourceCacheKey {
+        let key = ResourceCacheKey {
             url: url.to_string(),
             resource_type: request.resource_type,
             mode: request.mode,
             credentials: request.credentials,
-            initiator: request.initiator.as_ref().map(ToString::to_string),
-            referrer: request.referrer.as_ref().map(ToString::to_string),
             user_agent: self.user_agent.read().await.clone(),
-            extra_headers,
+            extra_headers: extra_headers.clone(),
             max_response_bytes: request.max_response_bytes,
-        })
+        };
+        tracing::warn!("resource_cache_key: url={} key={:?}", url, key);
+        Some(key)
     }
 
     async fn fetch_with_profile(
