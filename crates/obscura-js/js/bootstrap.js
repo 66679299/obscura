@@ -391,11 +391,32 @@ function _decodeDataScriptUrl(url) {
 globalThis.__markParserScripts = function(nids) {
   for (const nid of nids || []) __obscuraCore.ops.op_script_mark_started(+nid);
 };
+function __parseCacheControlMaxAge(cacheControl) {
+  if (!cacheControl) return 0;
+  const lowered = String(cacheControl).toLowerCase();
+  if (lowered.indexOf('no-store') !== -1 || lowered.indexOf('no-cache') !== -1) return 0;
+  const match = lowered.match(/max-age\s*=\s*"?([0-9]+)"?/);
+  return match ? parseInt(match[1], 10) : 0;
+}
+
 async function __fetchDynClassicScript(task) {
   let body;
   if (task.url.startsWith('data:')) {
     body = _decodeDataScriptUrl(task.url);
   } else {
+    // Fork addition: shared on-disk cache for dynamically injected scripts.
+    // Analytics bundles (gtag.js and friends) are re-fetched by every
+    // fresh-identity session; the first fetch stores the body with a TTL
+    // taken from the response's cache-control, later sessions within that
+    // window serve it from the shared directory (zero network transfer).
+    try {
+      const cached = await __obscuraCore.ops.op_script_cache_get(task.url);
+      if (cached && typeof cached.body === 'string' && cached.body.length > 0) {
+        return cached.body;
+      }
+    } catch (e) {
+      // cache miss/IO error: fall through to the network fetch
+    }
     const raw = await __obscuraCore.ops.op_fetch_url(
       task.url, "GET", "{}", new Uint8Array(0), task.pageOrigin, "no-cors", "same-origin", "Script"
     );
@@ -408,6 +429,16 @@ async function __fetchDynClassicScript(task) {
       throw new Error('HTTP ' + (parsed.status || 0));
     }
     body = parsed.body;
+    if (body && body.length > 256) {
+      try {
+        const maxAge = __parseCacheControlMaxAge(parsed.headers && parsed.headers['cache-control']);
+        if (maxAge > 0) {
+          __obscuraCore.ops.op_script_cache_put(task.url, body, maxAge);
+        }
+      } catch (e) {
+        // cache write failure is non-fatal
+      }
+    }
   }
   return body;
 }

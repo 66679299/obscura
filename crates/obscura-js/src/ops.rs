@@ -1,7 +1,9 @@
 use std::cell::{Cell, RefCell};
 use std::collections::{HashMap, HashSet, VecDeque};
+use std::path::PathBuf;
 use std::rc::Rc;
 use std::sync::Arc;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
 use deno_core::Extension;
@@ -985,6 +987,83 @@ impl Resource for FetchCancelResource {
 #[op2(fast)]
 fn op_fetch_cancel_handle(state: &mut OpState) -> u32 {
     state.resource_table.add(FetchCancelResource(CancelHandle::new_rc()))
+}
+
+// ---------------------------------------------------------------------------
+// Fork addition: shared on-disk cache for dynamically injected classic
+// scripts (analytics bundles such as gtag.js). Every fresh-identity session
+// refetched these; serving them from a shared disk directory (keyed by URL,
+// TTL from the response's cache-control) removes the repeat transfer while
+// keeping per-session cookie isolation untouched.
+// ---------------------------------------------------------------------------
+
+fn script_cache_dir() -> Option<PathBuf> {
+    let dir = std::env::var("OBSCURA_HTTP_CACHE_DIR").ok()?;
+    if dir.is_empty() {
+        return None;
+    }
+    let path = PathBuf::from(dir);
+    let _ = std::fs::create_dir_all(&path);
+    Some(path)
+}
+
+fn script_cache_fnv1a64(bytes: &[u8]) -> u64 {
+    let mut hash: u64 = 0xcbf29ce484222325;
+    for b in bytes {
+        hash ^= u64::from(*b);
+        hash = hash.wrapping_mul(0x100000001b3);
+    }
+    hash
+}
+
+fn script_cache_path(url: &str) -> Option<PathBuf> {
+    let dir = script_cache_dir()?;
+    let digest = script_cache_fnv1a64(url.as_bytes());
+    Some(dir.join(format!("dynscript-{:016x}.json", digest)))
+}
+
+fn script_cache_now_unix() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
+
+#[op2]
+#[serde]
+fn op_script_cache_get(#[string] url: String) -> Option<serde_json::Value> {
+    let path = script_cache_path(&url)?;
+    let bytes = std::fs::read(&path).ok()?;
+    let v: serde_json::Value = serde_json::from_slice(&bytes).ok()?;
+    let expires = v.get("expires_at_unix")?.as_u64()?;
+    if expires <= script_cache_now_unix() {
+        let _ = std::fs::remove_file(&path);
+        return None;
+    }
+    let body = v.get("body")?.as_str()?.to_string();
+    Some(serde_json::json!({ "body": body }))
+}
+
+#[op2(fast)]
+fn op_script_cache_put(#[string] url: String, #[string] body: String, #[bigint] max_age: i64) {
+    let Some(path) = script_cache_path(&url) else {
+        return;
+    };
+    if body.len() < 256 || max_age == 0 {
+        return;
+    }
+    let expires = script_cache_now_unix().saturating_add(max_age.max(0) as u64);
+    let payload = serde_json::json!({
+        "url": url,
+        "expires_at_unix": expires,
+        "body": body,
+    });
+    let tmp = path.with_extension("tmp");
+    if let Ok(bytes) = serde_json::to_vec(&payload) {
+        if std::fs::write(&tmp, &bytes).is_ok() {
+            let _ = std::fs::rename(&tmp, &path);
+        }
+    }
 }
 
 // Private signal state survives realm crossings without public prototype
@@ -7883,6 +7962,8 @@ pub fn build_extension() -> Extension {
         ops.push(op_canvas_paint_damage());
         ops.push(op_image_metadata());
         ops.push(op_load_image_metadata());
+        ops.push(op_script_cache_get());
+        ops.push(op_script_cache_put());
         ops.push(op_layout_geometry());
         ops.push(op_layout_box_metrics());
         ops.push(op_layout_hit_test());
