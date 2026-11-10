@@ -1,7 +1,8 @@
 use std::collections::{HashMap, VecDeque};
+use std::path::PathBuf;
 use std::sync::{Arc, OnceLock};
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use std::net::{IpAddr, SocketAddr};
 
@@ -861,6 +862,11 @@ pub struct ObscuraHttpClient {
     /// Lets `fetch_file_url` read local files. Off by default. Atomic because
     /// `BrowserContext` flips it after the client is already shared.
     allow_file_access: AtomicBool,
+    /// Fork addition: shared on-disk HTTP resource cache directory
+    /// (OBSCURA_HTTP_CACHE_DIR). When set, cacheable subresource responses are
+    /// persisted and reloaded on startup, so fresh-identity sessions (new
+    /// process each) still reuse static assets within their freshness window.
+    http_cache_dir: Option<std::path::PathBuf>,
 }
 
 const RESOURCE_CACHE_MAX_ENTRIES: usize = 256;
@@ -874,10 +880,11 @@ struct ResourceCacheKey {
     credentials: RequestCredentials,
     // Fork fix (#autoBrowserObscura): `initiator`/`referrer` are per-page values
     // and would make the key differ on every navigation of the same process,
-    // defeating cross-navigation reuse entirely. Chrome's HTTP cache keys on
-    // URL (+vary headers) only; credential safety is already handled by the
-    // sends_credentials_to / authorization / cookie checks below.
-    user_agent: String,
+    // defeating cross-navigation reuse entirely. `user_agent` is excluded so
+    // fresh-identity sessions (per-profile UA) still share one cached copy of
+    // static assets. Chrome's HTTP cache keys on URL (+vary headers) only;
+    // credential safety is already handled by the sends_credentials_to /
+    // authorization / cookie checks below.
     extra_headers: Vec<(String, String)>,
     max_response_bytes: usize,
 }
@@ -977,6 +984,210 @@ impl ResourceCache {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Fork addition: on-disk persistence for the in-process resource cache.
+// Serialized entries live in OBSCURA_HTTP_CACHE_DIR; a fresh process loads
+// them at startup so fresh-identity sessions reuse static assets (gtag.js,
+// hashed JS chunks, CSS) fetched within their freshness lifetime.
+// ---------------------------------------------------------------------------
+
+fn fnv1a64(bytes: &[u8]) -> u64 {
+    let mut hash: u64 = 0xcbf29ce484222325;
+    for b in bytes {
+        hash ^= u64::from(*b);
+        hash = hash.wrapping_mul(0x100000001b3);
+    }
+    hash
+}
+
+fn http_cache_entry_path(dir: &std::path::Path, key: &ResourceCacheKey) -> std::path::PathBuf {
+    let fingerprint = format!("{:?}", key);
+    dir.join(format!("httpcache-{:016x}.json", fnv1a64(fingerprint.as_bytes())))
+}
+
+fn http_cache_persist(
+    dir: &std::path::Path,
+    key: &ResourceCacheKey,
+    response: &Response,
+    lifetime: Duration,
+) {
+    use base64::Engine as _;
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    let payload = serde_json::json!({
+        "expires_at_unix": now.saturating_add(lifetime.as_secs()),
+        "key": {
+            "url": key.url,
+            "resource_type": format!("{:?}", key.resource_type),
+            "mode": format!("{:?}", key.mode),
+            "credentials": format!("{:?}", key.credentials),
+            "extra_headers": key.extra_headers,
+            "max_response_bytes": key.max_response_bytes,
+        },
+        "response": {
+            "url": response.url.to_string(),
+            "status": response.status,
+            "headers": response.headers,
+            "body_base64": base64::engine::general_purpose::STANDARD.encode(&response.body),
+            "redirected_from": response
+                .redirected_from
+                .iter()
+                .map(|u| u.to_string())
+                .collect::<Vec<_>>(),
+        }
+    });
+    let path = http_cache_entry_path(dir, key);
+    let tmp = path.with_extension("tmp");
+    if let Ok(bytes) = serde_json::to_vec(&payload) {
+        if std::fs::write(&tmp, &bytes).is_ok() {
+            let _ = std::fs::rename(&tmp, &path);
+        }
+    }
+}
+
+fn resource_type_from_str(s: &str) -> Option<ResourceType> {
+    match s {
+        "Document" => Some(ResourceType::Document),
+        "Script" => Some(ResourceType::Script),
+        "Stylesheet" => Some(ResourceType::Stylesheet),
+        "Image" => Some(ResourceType::Image),
+        "Font" => Some(ResourceType::Font),
+        "Xhr" => Some(ResourceType::Xhr),
+        "Fetch" => Some(ResourceType::Fetch),
+        "Other" => Some(ResourceType::Other),
+        _ => None,
+    }
+}
+
+fn request_mode_from_str(s: &str) -> Option<RequestMode> {
+    match s {
+        "Navigate" => Some(RequestMode::Navigate),
+        "NoCors" => Some(RequestMode::NoCors),
+        "Cors" => Some(RequestMode::Cors),
+        "SameOrigin" => Some(RequestMode::SameOrigin),
+        _ => None,
+    }
+}
+
+fn request_credentials_from_str(s: &str) -> Option<RequestCredentials> {
+    match s {
+        "Omit" => Some(RequestCredentials::Omit),
+        "SameOrigin" => Some(RequestCredentials::SameOrigin),
+        "Include" => Some(RequestCredentials::Include),
+        _ => None,
+    }
+}
+
+fn http_cache_load(dir: &std::path::Path) -> Vec<(ResourceCacheKey, Response, Duration)> {
+    use base64::Engine as _;
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    let mut out = Vec::new();
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return out;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.extension().and_then(|e| e.to_str()) != Some("json") {
+            continue;
+        }
+        let Ok(bytes) = std::fs::read(&path) else {
+            continue;
+        };
+        let Ok(v) = serde_json::from_slice::<serde_json::Value>(&bytes) else {
+            continue;
+        };
+        let expires_at_unix = v.get("expires_at_unix").and_then(|x| x.as_u64()).unwrap_or(0);
+        if expires_at_unix <= now {
+            let _ = std::fs::remove_file(&path);
+            continue;
+        }
+        let Some(loaded) = http_cache_entry_from_json(&v, now) else {
+            continue;
+        };
+        out.push(loaded);
+    }
+    out
+}
+
+fn http_cache_entry_from_json(
+    v: &serde_json::Value,
+    now_unix: u64,
+) -> Option<(ResourceCacheKey, Response, Duration)> {
+    use base64::Engine as _;
+    let expires_at_unix = v.get("expires_at_unix").and_then(|x| x.as_u64()).unwrap_or(0);
+    if expires_at_unix <= now_unix {
+        return None;
+    }
+    let k = v.get("key")?;
+    let url = k.get("url")?.as_str()?.to_string();
+    let resource_type = resource_type_from_str(k.get("resource_type")?.as_str()?)?;
+    let mode = request_mode_from_str(k.get("mode")?.as_str()?)?;
+    let credentials = request_credentials_from_str(k.get("credentials")?.as_str()?)?;
+    let extra_headers = k
+        .get("extra_headers")?
+        .as_array()?
+        .iter()
+        .filter_map(|pair| {
+            let arr = pair.as_array()?;
+            Some((
+                arr.first()?.as_str()?.to_string(),
+                arr.get(1)?.as_str()?.to_string(),
+            ))
+        })
+        .collect::<Vec<_>>();
+    let max_response_bytes = k.get("max_response_bytes")?.as_u64()? as usize;
+
+    let r = v.get("response")?;
+    let response_url = url::Url::parse(r.get("url")?.as_str()?).ok()?;
+    let status = u16::try_from(r.get("status")?.as_u64()?).ok()?;
+    let mut headers = HashMap::new();
+    for (name, value) in r.get("headers")?.as_object()?.iter() {
+        headers.insert(name.clone(), value.as_str()?.to_string());
+    }
+    let body = base64::engine::general_purpose::STANDARD
+        .decode(r.get("body_base64")?.as_str()?)
+        .ok()?;
+    let response = Response {
+        url: response_url,
+        status,
+        headers,
+        body,
+        redirected_from: Vec::new(),
+    };
+    let key = ResourceCacheKey {
+        url,
+        resource_type,
+        mode,
+        credentials,
+        extra_headers,
+        max_response_bytes,
+    };
+    Some((
+        key,
+        response,
+        Duration::from_secs(expires_at_unix.saturating_sub(now_unix)),
+    ))
+}
+
+impl ResourceCache {
+    /// Fork addition: hydrate the in-memory cache from the shared on-disk
+    /// directory, dropping entries whose freshness lifetime has already
+    /// elapsed (expired files are removed to keep the directory bounded).
+    fn load_persisted(&mut self, dir: &std::path::Path) -> usize {
+        let entries = http_cache_load(dir);
+        let n = entries.len();
+        for (key, response, lifetime) in entries {
+            self.insert(key, response, lifetime);
+        }
+        n
+    }
+}
+
 fn response_cache_lifetime(response: &Response) -> Option<Duration> {
     if !(200..300).contains(&response.status)
         || !response.redirected_from.is_empty()
@@ -1061,7 +1272,7 @@ impl ObscuraHttpClient {
         proxy_url: Option<&str>,
         allow_private_network: bool,
     ) -> Self {
-        ObscuraHttpClient {
+        let mut client = ObscuraHttpClient {
             client: tokio::sync::OnceCell::new(),
             proxy_url: proxy_url.map(|s| s.to_string()),
             cookie_jar,
@@ -1077,7 +1288,18 @@ impl ObscuraHttpClient {
             resource_loader: std::sync::Mutex::new(ResourceLoaderState::default()),
             allow_private_network,
             allow_file_access: AtomicBool::new(false),
+            http_cache_dir: None,
+        };
+        if let Ok(dir) = std::env::var("OBSCURA_HTTP_CACHE_DIR") {
+            if !dir.is_empty() {
+                let dir = std::path::PathBuf::from(dir);
+                let _ = std::fs::create_dir_all(&dir);
+                let loaded = client.resource_loader.lock().unwrap().cache.load_persisted(&dir);
+                client.http_cache_dir = Some(dir.clone());
+                tracing::info!("http cache loaded {} entries from {}", loaded, dir.display());
+            }
         }
+        client
     }
 
     pub fn allow_file_access(&self) -> bool {
@@ -1246,7 +1468,6 @@ impl ObscuraHttpClient {
             resource_type: request.resource_type,
             mode: request.mode,
             credentials: request.credentials,
-            user_agent: self.user_agent.read().await.clone(),
             extra_headers: extra_headers.clone(),
             max_response_bytes: request.max_response_bytes,
         };
@@ -1283,15 +1504,23 @@ impl ObscuraHttpClient {
         let acquisition = {
             let mut loader = self.resource_loader.lock().unwrap();
             if let Some(response) = loader.cache.get(&cache_key) {
+                tracing::debug!("http cache HIT: {}", url);
                 Acquisition::Cached(response)
-            } else if let Some(sender) = loader.shared_fetches.get(&cache_key) {
-                Acquisition::Follower(sender.subscribe())
             } else {
-                let (sender, _receiver) = watch::channel(None);
-                loader
-                    .shared_fetches
-                    .insert(cache_key.clone(), sender.clone());
-                Acquisition::Leader(sender)
+                tracing::debug!(
+                    "http cache MISS: {} (entries={})",
+                    url,
+                    loader.cache.entries.len()
+                );
+                if let Some(sender) = loader.shared_fetches.get(&cache_key) {
+                    Acquisition::Follower(sender.subscribe())
+                } else {
+                    let (sender, _receiver) = watch::channel(None);
+                    loader
+                        .shared_fetches
+                        .insert(cache_key.clone(), sender.clone());
+                    Acquisition::Leader(sender)
+                }
             }
         };
 
@@ -1359,10 +1588,13 @@ impl ObscuraHttpClient {
                     Ok(response) => match response_cache_lifetime(response) {
                         Some(lifetime) => {
                             self.resource_loader.lock().unwrap().cache.insert(
-                                cache_key,
+                                cache_key.clone(),
                                 response.clone(),
                                 lifetime,
                             );
+                            if let Some(dir) = &self.http_cache_dir {
+                                http_cache_persist(dir, &cache_key, response, lifetime);
+                            }
                             SharedFetchOutcome::Cacheable(response.clone())
                         }
                         None => SharedFetchOutcome::RetryUncoalesced,
@@ -1862,7 +2094,7 @@ mod ssrf_tests {
     use std::str::FromStr;
     use std::sync::Arc;
     use std::sync::atomic::{AtomicUsize, Ordering};
-    use std::time::Duration;
+    use std::path::PathBuf;
     use url::Url;
 
     fn ip(s: &str) -> IpAddr {
