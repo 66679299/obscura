@@ -3963,6 +3963,7 @@ async fn fetch_url_inner(
         let mut gs = gs.borrow_mut();
         for pattern in &gs.blocked_urls {
             if pattern == "*" || url.contains(pattern) || glob_match(pattern, &url) {
+                tracing::warn!("op_fetch_url BLOCKED-HIT: url={} pattern={:?} contains={} glob={}", url, pattern, url.contains(pattern), glob_match(pattern, &url));
                 return Ok(serde_json::json!({
                     "status": 0,
                     "body": "",
@@ -3987,9 +3988,10 @@ async fn fetch_url_inner(
             .as_ref()
             .and_then(|c| c.proxy_url().map(|s| s.to_string()));
         tracing::debug!(
-            "op_fetch_url: intercept_enabled={}, has_tx={}",
-            gs.intercept_enabled,
-            gs.intercept_tx.is_some()
+            "op_fetch_url VISIT: url={} blocked_count={} intercept_enabled={}",
+            url,
+            gs.blocked_urls.len(),
+            gs.intercept_enabled
         );
         // Allocate once, before interception. CDP must use this identity for
         // the request start, completion and retained response body.
