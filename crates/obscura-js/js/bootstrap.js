@@ -8319,6 +8319,7 @@ globalThis.navigator = {
       }
       Promise.resolve().then(() => _fetch(target, {
         method: "POST",
+        mode: "no-cors",
         headers: { "content-type": "text/plain;charset=UTF-8" },
         body: body,
         keepalive: true
