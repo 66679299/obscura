@@ -182,8 +182,11 @@ impl BrowserContext {
             proxy_url.as_deref(),
             allow_private_network,
         );
+        // Fork: keep block_trackers off even in stealth mode - the tracker
+        // blocklist includes google-analytics.com, which would silently drop
+        // GA4 /collect pings. Blocking is done via CDP setBlockedURLs upstream.
         if stealth {
-            client.block_trackers = true;
+            client.block_trackers = false;
         }
         let profile = crate::profiles::select_profile();
         let user_agent_override = user_agent.clone();
@@ -264,8 +267,9 @@ impl BrowserContext {
             self.proxy_url.as_deref(),
             self.allow_private_network,
         );
+        // Fork: same rationale as _new_inner - keep GA4 /collect alive.
         if self.stealth {
-            client.block_trackers = true;
+            client.block_trackers = false;
         }
         client.set_allow_file_access(self.allow_file_access);
         if let Ok(mut guard) = client.user_agent.try_write() {
